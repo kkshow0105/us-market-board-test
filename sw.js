@@ -1,6 +1,6 @@
 /* 只管理本项目的静态外壳。发布时同时更新HTML的app-version与此版本。 */
 'use strict';
-const APP_VERSION = '1.0.1';
+const APP_VERSION = '1.0.2';
 const BASE = new URL('./', self.location.href);
 const CACHE_PREFIX = 'us-market-board-test-shell:' + BASE.pathname + ':';
 const CACHE_NAME = CACHE_PREFIX + APP_VERSION;
