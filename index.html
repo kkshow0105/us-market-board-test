@@ -2,7 +2,14 @@
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="app-version" content="1.0.0">
+<meta name="theme-color" content="#f5f6f8">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="美股行情速览">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<link rel="manifest" href="./manifest.webmanifest">
+<link rel="apple-touch-icon" sizes="180x180" href="./icons/apple-touch-icon-180.png">
 <title>美股行情速览 · 指数 / 板块 / 商品</title>
 <style>
   :root{
@@ -191,6 +198,16 @@
     .card .price{font-size:16px}
   }
 </style>
+<style id="pwa-style">
+  body{min-height:100vh;min-height:100dvh;padding-top:calc(24px + env(safe-area-inset-top,0px));padding-right:max(20px,env(safe-area-inset-right,0px));padding-bottom:calc(40px + env(safe-area-inset-bottom,0px));padding-left:max(20px,env(safe-area-inset-left,0px))}
+  .pwa-notice{display:flex;align-items:center;justify-content:space-between;gap:8px 12px;flex-wrap:wrap;margin:0 0 10px;padding:10px 12px;background:#fff8eb;border:1px solid #f0dfbf;border-radius:9px;font-size:12px;line-height:1.6;overflow-wrap:anywhere}
+  .pwa-notice[hidden]{display:none}
+  .pwa-notice .btn{min-height:44px;flex:none}
+  .pwa-controls{display:flex;align-items:center;gap:6px 12px;flex-wrap:wrap;margin-bottom:10px;padding-bottom:10px;border-bottom:1px solid var(--line)}
+  .pwa-controls .btn{min-height:44px;font-size:12px}
+  #appVersion{font-weight:600;white-space:nowrap}
+  @media(max-width:620px){body{padding-top:calc(12px + env(safe-area-inset-top,0px));padding-right:max(12px,env(safe-area-inset-right,0px));padding-bottom:calc(28px + env(safe-area-inset-bottom,0px));padding-left:max(12px,env(safe-area-inset-left,0px))}}
+</style>
 </head>
 <body>
 <div class="wrap">
@@ -219,6 +236,8 @@
     <span id="countdown"></span>
   </div>
 
+  <div class="pwa-notice" id="pwaNetwork" role="status" hidden>当前离线，本次未更新行情；仅展示仍通过校验的历史记录，请核对实际日期。</div>
+  <div class="pwa-notice" id="pwaUpdate" role="status" hidden><span id="pwaUpdateText">新版程序已就绪</span><button class="btn" id="pwaUpdateBtn" type="button">立即更新</button></div>
   <div class="grid" id="grid"></div>
 
   <!-- GICS 11 大行业 -->
@@ -259,6 +278,7 @@
   </section>
 
   <footer>
+    <div class="pwa-controls"><span id="appVersion">程序 v1.0.0</span><span id="pwaStatus" role="status">正在准备离线界面…</span><button class="btn" id="pwaCheckBtn" type="button">检查程序更新</button></div>
     <div><b>商品收盘口径</b>：卡片的“日收盘参考”对应源端实际日期；涨跌仅在同一具体月份合约的连续两日历史收盘参考价可比时展示，不代表交易所官方结算涨跌。商品曲线采用通过校验的同月合约未调整历史价格；价格可信但比较基准未验证时，涨跌显示 --。进入新交易时段后，旧收盘参考仍须通过原有有效性校验。</div>
     <div><b>数据源</b>：CNBC 行情接口（主）／腾讯财经、东方财富（备用），当前使用公开匿名接口，无需 API Key；访问策略可能变化。备用源需通过身份、日期和口径校验。</div>
     <div><b>说明</b>：黄金取 COMEX 黄金连续期货入口（@GC.1），原油取 ICE 布伦特连续期货入口（@LCO.1），具体合约以源端返回为准，均非现货。期货基准未确认时不显示涨跌；不兼容备用源不自动替换。美股仅显示通过日期校验的常规时段报价；仅日期报价不作为盘中实时价。涨跌颜色按国内习惯：涨红跌绿。行情仅供参考，不构成投资建议。</div>
@@ -1135,6 +1155,123 @@ window.addEventListener('online',()=>{Object.keys(sourceHealth).forEach(k=>delet
 window.addEventListener('offline',()=>{if(activeRefresh)activeRefresh.ctrl.abort();document.getElementById('stateText').textContent='网络已断开；仅保留仍通过日期校验的数据';render();renderSectors();});
 ITEMS.forEach(it=>{state[it.key]=invalid({},'等待有效报价');});loadCache();render();renderSectors();refresh(true);
 
+</script>
+<script id="pwa-script">
+/* 独立PWA外壳：不调用或改变行情获取、缓存、校验及刷新函数。 */
+(() => {
+  'use strict';
+  const version = document.querySelector('meta[name="app-version"]').content;
+  const status = document.getElementById('pwaStatus'), notice = document.getElementById('pwaUpdate');
+  const updateButton = document.getElementById('pwaUpdateBtn'), checkButton = document.getElementById('pwaCheckBtn');
+  document.getElementById('appVersion').textContent = '程序 v' + version;
+  let registration, registering = false, checking = false, lastCheck = 0, confirmed = false, reloaded = false, activeUpdate = false, updateTimer;
+  const networkNotice = () => { document.getElementById('pwaNetwork').hidden = navigator.onLine; };
+  networkNotice();
+  window.addEventListener('offline', networkNotice);
+  window.addEventListener('online', networkNotice);
+  if (!('serviceWorker' in navigator) || location.protocol !== 'https:') {
+    status.textContent = '此环境不支持离线安装；请使用HTTPS站点';
+    checkButton.disabled = true;
+    return;
+  }
+  function workerVersion(worker) {
+    return new Promise(resolve => {
+      if (!worker) return resolve(null);
+      const channel = new MessageChannel();
+      const timer = setTimeout(() => { channel.port1.close(); resolve(null); }, 2500);
+      channel.port1.onmessage = event => { clearTimeout(timer); channel.port1.close(); resolve(event.data?.version || null); };
+      try { worker.postMessage({type:'GET_VERSION'}, [channel.port2]); }
+      catch (_) { clearTimeout(timer); channel.port1.close(); resolve(null); }
+    });
+  }
+  function reloadOnce() {
+    if (reloaded) return;
+    reloaded = true;
+    clearTimeout(updateTimer);
+    location.reload();
+  }
+  async function showWaiting() {
+    const worker = registration?.waiting;
+    if (!worker) return;
+    const next = await workerVersion(worker);
+    if (registration.waiting !== worker) return;
+    document.getElementById('pwaUpdateText').textContent = next ? '新版程序 v' + next + ' 已就绪' : '新版程序已就绪';
+    notice.hidden = false;
+  }
+  async function controllerReady() {
+    if (confirmed) return reloadOnce();
+    const current = await workerVersion(navigator.serviceWorker.controller || registration?.active);
+    if (!current) return;
+    status.textContent = '离线界面已准备；行情仍需联网校验';
+    if (current !== version) {
+      activeUpdate = true;
+      notice.hidden = false;
+      document.getElementById('pwaUpdateText').textContent = '新版程序 v' + current + ' 已启用，点击载入';
+    }
+  }
+  async function checkUpdates(force = false) {
+    if (checking || registering) return;
+    if (!navigator.onLine) { status.textContent = '当前离线，联网后可检查程序更新'; return; }
+    if (!force && Date.now() - lastCheck < 60000) return;
+    if (!registration) return registerApp();
+    checking = true;
+    lastCheck = Date.now();
+    checkButton.disabled = true;
+    try {
+      await registration.update();
+      await showWaiting();
+      status.textContent = registration.waiting ? '新版已下载，等待确认' : registration.active ? '未发现新版本；离线界面已准备' : '正在准备离线界面…';
+    } catch (_) {
+      status.textContent = '程序更新检查失败，请稍后重试';
+    } finally {
+      checking = false;
+      checkButton.disabled = false;
+    }
+  }
+  checkButton.addEventListener('click', () => checkUpdates(true));
+  updateButton.addEventListener('click', () => {
+    if (reloaded || confirmed) return;
+    if (!registration?.waiting && activeUpdate) return reloadOnce();
+    if (!registration?.waiting) { notice.hidden = true; return checkUpdates(true); }
+    confirmed = true;
+    updateButton.disabled = true;
+    status.textContent = '正在切换新版程序…';
+    registration.waiting.postMessage({type:'ACTIVATE_UPDATE'});
+    updateTimer = setTimeout(() => {
+      if (!reloaded) { confirmed = false; updateButton.disabled = false; status.textContent = '更新尚未完成，请重试'; }
+    }, 10000);
+  });
+  navigator.serviceWorker.addEventListener('controllerchange', controllerReady);
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) checkUpdates(); });
+  window.addEventListener('online', () => checkUpdates());
+  async function registerApp() {
+    if (registering) return;
+    registering = true;
+    lastCheck = Date.now();
+    try {
+      const reg = await navigator.serviceWorker.register('./sw.js', {scope:'./', updateViaCache:'none'});
+      registration = reg;
+      const watchInstalling = () => {
+        const worker = reg.installing;
+        if (worker) worker.addEventListener('statechange', () => {
+          if (worker.state === 'installed') showWaiting();
+          if (worker.state === 'activated') controllerReady();
+          if (worker.state === 'redundant') status.textContent = '离线版本准备失败，请联网后重试';
+        });
+      };
+      reg.addEventListener('updatefound', watchInstalling);
+      watchInstalling();
+      await controllerReady();
+      await showWaiting();
+    } catch (_) {
+      status.textContent = navigator.serviceWorker.controller ? '离线界面可用，程序更新检查失败' : '离线界面尚未就绪；联网后可重试';
+    } finally {
+      registering = false;
+    }
+    if (registration) await checkUpdates(true);
+  }
+  registerApp();
+})();
 </script>
 </body>
 </html>

@@ -1,0 +1,16 @@
+{
+  "id": "./",
+  "name": "美股行情速览",
+  "short_name": "美股速览",
+  "lang": "zh-CN",
+  "description": "独立美股行情看板，行情由浏览器直接获取并校验。",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#f5f6f8",
+  "theme_color": "#f5f6f8",
+  "icons": [
+    { "src": "./icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "./icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" }
+  ]
+}
