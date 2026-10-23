@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta name="app-version" content="1.0.2">
+<meta name="app-version" content="1.0.3">
 <meta name="theme-color" content="#f5f6f8">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-title" content="美股行情速览">
@@ -278,7 +278,7 @@
   </section>
 
   <footer>
-    <div class="pwa-controls"><span id="appVersion">程序 v1.0.2</span><span id="pwaStatus" role="status">正在准备离线界面…</span><button class="btn" id="pwaCheckBtn" type="button">检查程序更新</button></div>
+    <div class="pwa-controls"><span id="appVersion">程序 v1.0.3</span><span id="pwaStatus" role="status">正在准备离线界面…</span><button class="btn" id="pwaCheckBtn" type="button">检查程序更新</button></div>
     <div><b>商品收盘口径</b>：卡片的“日收盘参考”对应源端实际日期；涨跌仅在同一具体月份合约的连续两日历史收盘参考价可比时展示，不代表交易所官方结算涨跌。商品曲线采用通过校验的同月合约未调整历史价格；价格可信但比较基准未验证时，涨跌显示 --。进入新交易时段后，旧收盘参考仍须通过原有有效性校验。</div>
     <div><b>数据源</b>：CNBC 行情接口（主）／腾讯财经、东方财富（备用），当前使用公开匿名接口，无需 API Key；访问策略可能变化。备用源需通过身份、日期和口径校验。</div>
     <div><b>说明</b>：黄金取 COMEX 黄金连续期货入口（@GC.1），原油取 ICE 布伦特连续期货入口（@LCO.1），具体合约以源端返回为准，均非现货。期货基准未确认时不显示涨跌；不兼容备用源不自动替换。美股仅显示通过日期校验的常规时段报价；仅日期报价不作为盘中实时价。涨跌颜色按国内习惯：涨红跌绿。行情仅供参考，不构成投资建议。</div>
@@ -535,6 +535,93 @@ function commodityContract(d) {
   if('FGHJKMNQUVXZ'[month]!==m[2]||!named[2].endsWith(m[3]))return null;
   return '20'+named[2]+'-'+String(month+1).padStart(2,'0');
 }
+
+function commodityLiveBaseline(d,now=Date.now()) {
+  const e=d.commodityEvidence,previous=previousCommodityHistoryDate(d.tradeDate,d.instrument);
+  if(d.src!=='CNBC'||!previous||d.settleDate!==previous||!Number.isFinite(d.settlePrice)||d.settlePrice<=0||
+    !e||!Number.isFinite(e.fetchedAt)||e.fetchedAt>now+300000||now-e.fetchedAt>600000)return false;
+  return verifyCommodityHistoryIdentity(e,{...d,price:d.settlePrice,tradeDate:previous});
+}
+function applyCommodityLiveChange(d,now=Date.now()) {
+  const base={...d,prev:NaN,chg:NaN,pct:NaN,basis:'unknown',basisLabel:'涨跌基准未验证',comparisonKind:null};
+  if(!commodityLiveBaseline(d,now))return base;
+  const prev=d.settlePrice,change=d.price-prev,pct=change/prev*100;
+  // 使用原有报价容差；不倒推前收，不覆盖源端非空冲突。
+  const reported=Number.isFinite(d.reportedChg)&&Number.isFinite(d.reportedPct);
+  if(reported&&(Math.abs(d.reportedChg-change)>Math.max(.025,d.price*.00001)||Math.abs(d.reportedPct-pct)>.035))return base;
+  if(reported&&(!Number.isFinite(d.prevReported)||Math.abs(d.prevReported-prev)>.000001))return base;
+  return {...base,prev,chg:reported?d.reportedChg:change,pct:reported?d.reportedPct:pct,
+    basis:'previous-contract-settlement',comparisonKind:reported?'source-settlement-change':'calculated-settlement-change',
+    basisLabel:(reported?'源报涨跌':'计算涨跌')+' · 相对'+d.settleDate+'同合约前结算参考'};
+}
+function inspectCommodityLiveChart(history,d,now=Date.now()) {
+  if(!history||!commodityLiveBaseline(d,now)||history.contract!==d.contract||history.src!=='CNBC'||
+    history.tradeDate!==d.tradeDate||history.adjusted!=='UNADJUSTED'||history.scope!=='fixed-contract'||
+    !Number.isFinite(history.fetchedAt)||history.fetchedAt>now+300000||now-history.fetchedAt>600000||
+    !verifyCommodityHistoryIdentity(history.identity,{...d,price:d.settlePrice,tradeDate:d.settleDate})||
+    !Array.isArray(history.bars)||history.bars.length<2)return null;
+  const bars=history.bars;
+  if(history.kind==='commodity-intraday') {
+    if(bars.some((b,i)=>!Number.isFinite(b.at)||!Number.isFinite(b.close)||b.close<=0||b.at>Math.floor(d.quoteAt/60000)*60000-60000||
+      commodityPhase(d.instrument,b.at).tradeDate!==d.tradeDate||(i&&bars[i-1].at>=b.at))||d.quoteAt-bars.at(-1).at>1800000)return null;
+  }else if(history.kind==='commodity-live-daily') {
+    if(bars.length!==20||bars.at(-1).date!==d.settleDate||Math.abs(bars.at(-1).close-d.settlePrice)>.000001||
+      bars.some((b,i)=>!validDate(b.date)||!Number.isFinite(b.close)||b.close<=0||(i&&previousCommodityHistoryDate(b.date,d.instrument)!==bars[i-1].date)))return null;
+  }else return null;
+  return {bars,chartReady:true};
+}
+function buildCommodityLiveChart(j,meta,d,intraday,now=Date.now()) {
+  const data=j?.barData,details=j?.requestDetails;
+  if(!commodityLiveBaseline({...d,commodityEvidence:{...meta,fetchedAt:now}},now)||!data||!details||details.symbol!==d.contract||details.adjusted!=='UNADJUSTED'||
+    data.companyName!==meta.name||String(data.symbol)!==(intraday?d.contract:String(meta.issue_id))||!Array.isArray(data.priceBars))throw new Error('盘中商品历史合约或口径不符');
+  let bars=[];const seen=new Set();
+  for(const b of data.priceBars) {
+    if((b.contract&&b.contract!==d.contract)||b.rollover||b.adjustment)throw new Error('商品序列混入换月或调整');
+    const close=num(b.close),raw=String(b.tradeTime||'');
+    if(!Number.isFinite(close)||close<=0)throw new Error('历史价格异常');
+    if(intraday) {
+      const at=num(b.tradeTimeinMills);
+      if(!Number.isFinite(at)||!/^\d{14}$/.test(raw)||at>now+300000)throw new Error('分钟时间异常或来自未来');
+      const p=zoneParts(at),printed=p.date.replace(/-/g,'')+String(Math.floor(p.minute/60)).padStart(2,'0')+String(p.minute%60).padStart(2,'0')+String(p.second).padStart(2,'0');
+      if(printed!==raw||seen.has(at))throw new Error('分钟时区或重复时间冲突');seen.add(at);
+      const phase=commodityPhase(d.instrument,at);
+      if(phase.known&&phase.live&&phase.tradeDate===d.tradeDate&&at<=Math.floor(d.quoteAt/60000)*60000-60000)bars.push({at,close});
+    }else {
+      const date=raw.slice(0,8).replace(/^(\d{4})(\d{2})(\d{2})$/,'$1-$2-$3');
+      if(!/^\d{8}000000$/.test(raw)||!validDate(date)||seen.has(date))throw new Error('日线日期或重复异常');seen.add(date);
+      if(date<=d.settleDate)bars.push({date,close});
+    }
+  }
+  bars.sort((a,b)=>intraday?a.at-b.at:a.date.localeCompare(b.date));
+  if(!intraday)bars=bars.slice(-20);
+  const history={kind:intraday?'commodity-intraday':'commodity-live-daily',contract:d.contract,src:'CNBC',tradeDate:d.tradeDate,
+    adjusted:'UNADJUSTED',scope:'fixed-contract',identity:meta,bars,fetchedAt:now};
+  if(!inspectCommodityLiveChart(history,{...d,commodityEvidence:{...meta,fetchedAt:now}},now))throw new Error('商品历史日期、末值或新鲜度不符');
+  return history;
+}
+async function refreshCommodityLive(force,run) {
+  const items=ITEMS.filter(it=>it.kind==='cmd'&&state[it.key]&&!state[it.key].cached&&validateQuote(state[it.key]).ok&&state[it.key].quoteType!=='settlement');
+  if(!items.length)return;
+  const snapshots=new Map(items.map(it=>[it.key,state[it.key]]));
+  let metadata;
+  try{metadata=quoteArray(await fetchJSON(quoteURL(items.map(it=>snapshots.get(it.key).contract)),10000,run.ctrl.signal));}
+  catch(e){if(isCurrent(run)){items.forEach(it=>{state[it.key].commodityHistoryError=e.message;});render();}return;}
+  await Promise.all(items.map(async it=>{
+    const quote=snapshots.get(it.key),meta=metadata.find(m=>m.symbol===quote.contract);
+    if(!isCurrent(run)||state[it.key]!==quote)return;
+    quote.commodityEvidence={...meta,fetchedAt:Date.now()};
+    if(!commodityLiveBaseline(quote)){quote.commodityHistoryError='同合约前结算日期或价格未验证';return;}
+    if(!force&&inspectCommodityLiveChart(quote.spark,quote))return;
+    try{
+      let history;
+      try{history=buildCommodityLiveChart(await fetchJSON(`${CNBC_CHART.replace('1M.json','1D.json')}?symbol=${encodeURIComponent(quote.contract)}&_=${Date.now()}`,9000,run.ctrl.signal),meta,quote,true);}
+      catch(e){if(run.ctrl.signal.aborted)throw e;history=buildCommodityLiveChart(await fetchJSON(`${CNBC_CHART}?symbol=${encodeURIComponent(quote.contract)}&_=${Date.now()}`,9000,run.ctrl.signal),meta,quote,false);}
+      if(isCurrent(run)&&state[it.key]===quote){quote.spark=history;quote.commodityHistoryError='';}
+    }catch(e){if(isCurrent(run)&&state[it.key]===quote){quote.commodityHistoryError=e.message;if(!inspectCommodityLiveChart(quote.spark,quote))quote.spark=null;}}
+  }));
+  if(isCurrent(run)){render();saveCache();}
+}
+
 function validateCommodityQuote(d,now=Date.now()) {
   const month=commodityContract(d),phase=commodityPhase(d.instrument,now);
   if(!month)return invalid(d,'具体期货合约、月份或品种不一致');
@@ -560,9 +647,9 @@ function validateCommodityQuote(d,now=Date.now()) {
   if(d.tradeDateVerified&&d.tradeDate!==phase.tradeDate)return invalid(d,'源端期货交易日期与报价时段冲突');
   if(validDate(d.expiry)&&phase.tradeDate>d.expiry)return invalid(d,'期货合约已到期');
   if(phase.tradeDate.slice(0,7)>month)return invalid(d,'期货合约月份已过期');
-  return {...d,ok:true,msg:'',validity:'recent_quote',contractMonth:month,tradeDate:phase.tradeDate,tradeDateVerified:true,
+  return applyCommodityLiveChange({...d,ok:true,msg:'',validity:'recent_quote',contractMonth:month,tradeDate:phase.tradeDate,tradeDateVerified:true,
     prev:NaN,chg:NaN,pct:NaN,basis:'unknown',basisLabel:'涨跌基准未验证',
-    status:{text:'期货交易时段 · 近期报价',live:true},when:whenText(d)};
+    status:{text:'期货交易时段 · 近期报价',live:true},when:whenText(d)},now);
 }
 function selectCommodityQuote(d,now=Date.now()) {
   const recent=validateQuote(d,now);
@@ -649,6 +736,7 @@ function buildCommodityHistory(j,meta,d,now=Date.now()) {
   return history;
 }
 async function refreshCommodityHistory(force,run) {
+  if(ITEMS.some(it=>it.kind==='cmd'&&state[it.key]&&state[it.key].quoteType!=='settlement'))await refreshCommodityLive(force,run);
   const items=ITEMS.filter(it=>it.kind==='cmd'&&state[it.key]&&!state[it.key].cached&&validateQuote(state[it.key]).ok&&
     state[it.key].quoteType==='settlement'&&(force||!inspectCommodityHistory(state[it.key].spark,state[it.key])||Date.now()-state[it.key].spark.fetchedAt>=600000));
   if(!items.length)return;
@@ -694,6 +782,7 @@ function validateQuote(d, now=Date.now()) {
   if(tradingDay(d.tradeDate)!==true)return invalid(d,'报价日期不是已知美股交易日');
   if(d.tradeDate!==phase.targetDate)return invalid(d,`日期过旧或不符：${d.tradeDate}，需要${phase.targetDate}`,'expired');
   if(d.session!=='regular')return invalid(d,'未确认常规时段报价，未作为收盘使用');
+  if(!phase.live&&((d.kind==='idx'&&d.pct===0)||d.unverifiedZero)&&!closeEvidenceValid(d))return invalid(d,'零涨跌需连续交易日收盘证据，不能仅凭UNCH确认');
   if(!Number.isFinite(d.prev)||d.prev<=0||!Number.isFinite(d.chg)||!Number.isFinite(d.pct)||d.pct<=-100||Math.abs(d.pct)>1000)return invalid(d,'昨收或涨跌字段异常');
   const calc=d.price-d.prev, pct=calc/d.prev*100;
   if(Math.abs(d.chg-calc)>Math.max(.025,d.price*.00001)||Math.abs(d.pct-pct)>.035)return invalid(d,'价格与涨跌基准不一致');
@@ -711,7 +800,7 @@ function validateQuote(d, now=Date.now()) {
   }
   if(Number.isFinite(d.quoteAt)) {
     const p=zoneParts(d.quoteAt), close=EARLY_CLOSE.has(d.tradeDate)?780:960;
-    if(p.minute<close-5||p.minute>close+30)return invalid(d,'非收盘附近常规报价，不能作为最近收盘');
+    if((p.minute<close-5||p.minute>close+30)&&!(d.kind==='idx'&&closeEvidenceValid(d)))return invalid(d,'非收盘附近常规报价，不能作为最近收盘');
   }
   return {...d,ok:true,validity:'recent_close',status:{text:d.timePrecision==='date'?'最近交易日常规报价':'最近收盘参考',live:false},when:whenText(d)};
 }
@@ -734,15 +823,89 @@ function parseCNBC(q,it,now=Date.now()) {
   const contractOK=kind!=='cmd'||(it.key==='gc'?/^GC[FGHJKMNQUVXZ]\d{1,2}$/:/^LCO[FGHJKMNQUVXZ]\d{1,2}$/).test(contract);
   const d={symbol,name:q.name,src:'CNBC',kind,price,prev,chg:kind==='cmd'?NaN:chg,pct:kind==='cmd'?NaN:pct,
     reportedChg:chg,reportedPct:pct,open:num(q.open),high:num(q.high),low:num(q.low),...time,fetchedAt:now,
+    ...(kind!=='cmd'&&(/^UNCH$/i.test(String(q.change))||/^UNCH$/i.test(String(q.change_pct)))?{unverifiedZero:true}:{}),
     identityVerified:verifyIdentity(q,it,symbol)&&contractOK,session:kind==='cmd'?'unknown':'regular',issueId:String(q.issue_id||''),
     rawTimedate:q.last_timedate||'',sourceTimeZone:q.timeZone||'',currency:q.currencyCode||null,exchange:q.exchange||null,sourceRealTime:q.realTime,
     quoteDate:time.tradeDate,tradeDate:kind==='cmd'?null:time.tradeDate,tradeDateVerified:kind!=='cmd',
     instrument:it?it.key:symbol,instrumentType:kind==='cmd'?'continuous-future':'cash',contract,
     basis:kind==='cmd'?'unknown':'previous-close',basisLabel:kind==='cmd'?'源端基准未确认（前收/结算）':'昨收',
     sourceStatus:q.curmktstatus,settlePrice:num(q.settlePrice),settleDate:q.settleDate,
-    contractName:kind==='cmd'?q.name:null,expiry:q.expiration_date||null,cached:false};
+    ...(kind==='cmd'?{prevReported:prev}:{}),contractName:kind==='cmd'?q.name:null,expiry:q.expiration_date||null,cached:false};
   return kind==='cmd'?selectCommodityQuote(d,now):validateQuote(d,now);
 }
+
+// 腾讯候选备用：标准 HTTPS fetch；浏览器跨域验收待完成，不使用代理或执行响应脚本。
+const TENCENT_IDENTITIES = {"XLK":["XLK.AM","Select Sector Spdr Trust State Street Technology Select Sector Sp","GP-ETF"],"XLF":["XLF.AM","State Street Financial Select Sector Spdr Etf","GP-ETF"],"XLV":["XLV.AM","Select Sector Spdr Trust State Street Health Care Select Sector S","GP-ETF"],"XLY":["XLY.AM","Select Sector Spdr Trust Sst Cnsmr Discretionary Slct Sctr Spdr E","GP-ETF"],"XLP":["XLP.AM","State Street Consumer Staples Select Sector Spdr Etf","GP-ETF"],"XLE":["XLE.AM","Select Sector Spdr Trust State Street Energy Select Sector Spdr E","GP-ETF"],"XLI":["XLI.AM","Select Sector Spdr Trust State Street Industrial Select Sector Sp","GP-ETF"],"XLB":["XLB.AM","Select Sector Spdr Trust State Street Mtrls Slct Sctr Spdr Etf","GP-ETF"],"XLU":["XLU.AM","Select Sector Spdr Trust State Street Utlts Slct Sctr Spdr Etf","GP-ETF"],"XLRE":["XLRE.AM","Select Sector Spdr Trust State Street Real Estate Select Sector S","GP-ETF"],"XLC":["XLC.AM","Select Sector Spdr Trust State Street Communication Services Sele","GP-ETF"],"GE":["GE.N","Ge Aerospace","GP"],"RTX":["RTX.N","Rtx Corporation","GP"],"CAT":["CAT.N","Caterpillar, Inc.","GP"],"HON":["HON.OQ","Honeywell International Inc.","GP"],"LMT":["LMT.N","Lockheed Martin Corporation","GP"],"BA":["BA.N","Boeing Company (The)","GP"],"ETN":["ETN.N","Eaton Corporation, Plc","GP"],"DE":["DE.N","Deere & Company","GP"],"NOC":["NOC.N","Northrop Grumman Corporation","GP"],"GD":["GD.N","General Dynamics Corporation","GP"],"CTAS":["CTAS.OQ","Cintas Corporation","GP"],"WM":["WM.N","Waste Management, Inc.","GP"],"PAYX":["PAYX.OQ","Paychex, Inc.","GP"],"VRSK":["VRSK.OQ","Verisk Analytics, Inc.","GP"],"RSG":["RSG.N","Republic Services, Inc.","GP"],"EFX":["EFX.N","Equifax, Inc.","GP"],"IYT":["IYT.AM","Ishares Trust U.S.Transportation Etf","GP-ETF"],"CARZ":["CARZ.OQ","First Trust Exch Traded Fund 2 S Network Elec & Future Veh","GP-ETF"],"NKE":["NKE.N","Nike, Inc.","GP"],"LEN":["LEN.N","Lennar Corporation","GP"],"DHI":["DHI.N","D.R. Horton, Inc.","GP"],"LULU":["LULU.OQ","Lululemon Athletica Inc.","GP"],"PHM":["PHM.N","Pultegroup, Inc.","GP"],"GRMN":["GRMN.N","Garmin Ltd.","GP"],"NVR":["NVR.N","Nvr, Inc.","GP"],"HAS":["HAS.OQ","Hasbro, Inc.","GP"],"PEJ":["PEJ.AM","Invesco Exchange Traded Fd Tr Leisure And Entertainment Etf","GP-ETF"],"XRT":["XRT.AM","State Street Spdr S&P Retail Etf","GP-ETF"],"COST":["COST.OQ","Costco Wholesale Corporation","GP"],"WMT":["WMT.OQ","Walmart Inc.","GP"],"SYY":["SYY.N","Sysco Corporation","GP"],"KR":["KR.N","Kroger Company (The)","GP"],"PBJ":["PBJ.AM","Invesco Exchange Traded Fd Tr Dynamic Food & Beverage Etf","GP-ETF"],"PG":["PG.N","Procter & Gamble Company (The)","GP"],"CL":["CL.N","Colgate-Palmolive Company","GP"],"KMB":["KMB.OQ","Kimberly-Clark Corporation","GP"],"EL":["EL.N","Estee Lauder Companies, Inc. (The)","GP"],"IHI":["IHI.AM","Ishares Trust U.S. Medical Devices Etf","GP-ETF"],"IBB":["IBB.OQ","Ishares Trust Ishares Biotechnology Etf","GP-ETF"],"KBE":["KBE.AM","State Street Spdr S&P Bank Etf","GP-ETF"],"KCE":["KCE.AM","State Street Spdr S&P Capital Markets Etf","GP-ETF"],"KIE":["KIE.AM","State Street Spdr S&P Insurance Etf","GP-ETF"],"IGV":["IGV.AM","Ishares Trust Expanded Tech-Software Sector Etf","GP-ETF"],"AAPL":["AAPL.OQ","Apple Inc.","GP"],"CSCO":["CSCO.OQ","Cisco Systems, Inc.","GP"],"ANET":["ANET.N","Arista Networks, Inc.","GP"],"DELL":["DELL.N","Dell Technologies Inc.","GP"],"MSI":["MSI.N","Motorola Solutions, Inc.","GP"],"HPQ":["HPQ.N","Hp Inc.","GP"],"SMH":["SMH.OQ","Vaneck Etf Tr Semiconductor Etf","GP-ETF"],"XTL":["XTL.AM","State Street Spdr S&P Telecom Etf","GP-ETF"],"META":["META.OQ","Meta Platforms, Inc.","GP"],"GOOGL":["GOOGL.OQ","Alphabet Inc.","GP"],"NFLX":["NFLX.OQ","Netflix, Inc.","GP"],"DIS":["DIS.N","Walt Disney Company (The)","GP"],"CMCSA":["CMCSA.OQ","Comcast Corporation","GP"],"CBRE":["CBRE.N","Cbre Group Inc","GP"],"CSGP":["CSGP.OQ","Costar Group, Inc.","GP"],"ZG":["ZG.OQ","Zillow Group, Inc.","GP"],"VNQ":["VNQ.AM","Vanguard Index Funds Real Estate Etf","GP-ETF"]};
+const INDEX_HISTORY_IDS={spx:'593933',ndx:'579435',sox:'577591',nbi:'567026'};
+function closeEvidenceValid(d) {
+  const e=d.closeEvidence;
+  return !!e && e.date===d.tradeDate && e.previousDate===previousTradingDay(d.tradeDate) &&
+    e.price===d.price && e.previous===d.prev && e.source==='CNBC日线' && e.adjusted==='UNADJUSTED';
+}
+function restoreIndexClose(j,it,now=Date.now()) {
+  const phase=usPhase(now),data=j&&j.barData,details=j&&j.requestDetails;
+  if(phase.live||!phase.targetDate||!data||!details||details.symbol!==it.cnbc||details.adjusted!=='UNADJUSTED'||
+    String(data.symbol)!==INDEX_HISTORY_IDS[it.key]||!INDEX_NAMES[it.key].test(data.companyName||'')||!Array.isArray(data.priceBars))throw new Error('指数收盘历史身份或口径未验证');
+  const bars=data.priceBars.map(b=>({date:String(b.tradeTime||'').slice(0,8).replace(/^(\d{4})(\d{2})(\d{2})$/,'$1-$2-$3'),close:num(b.close),raw:String(b.tradeTime||'')}));
+  if(bars.some(b=>!/^\d{8}000000$/.test(b.raw)||!validDate(b.date)||tradingDay(b.date)!==true||b.date>phase.targetDate||!Number.isFinite(b.close)||b.close<=0)||new Set(bars.map(b=>b.date)).size!==bars.length)throw new Error('指数历史日期、重复或价格异常');
+  bars.sort((a,b)=>a.date.localeCompare(b.date));
+  const last=bars.at(-1),previous=bars.at(-2);
+  if(!last||!previous||last.date!==phase.targetDate||previous.date!==previousTradingDay(last.date))throw new Error('缺少最近连续两个交易日收盘');
+  const price=last.close,prev=previous.close;
+  return validateQuote({symbol:it.cnbc,name:data.companyName,instrument:it.key,kind:'idx',src:'CNBC',identityVerified:true,
+    issueId:String(data.symbol),price,prev,chg:price-prev,pct:(price/prev-1)*100,tradeDate:last.date,quoteAt:null,timePrecision:'date',
+    fetchedAt:now,session:'regular',basis:'previous-close',basisLabel:'连续两交易日未调整收盘',cached:false,
+    closeEvidence:{source:'CNBC日线',adjusted:'UNADJUSTED',date:last.date,previousDate:previous.date,price,previous:prev},
+    spark:{symbol:it.cnbc,src:'CNBC',bars:bars.slice(-22).map(({date,close})=>({date,close})),endDate:last.date,fetchedAt:now}},now);
+}
+async function fetchIndexClose(it,signal) {
+  return withCooldown('index-close-'+it.key,async()=>restoreIndexClose(await fetchJSON(`${CNBC_CHART}?symbol=${encodeURIComponent(it.cnbc)}&_=${Date.now()}`,9000,signal),it));
+}
+function parseTencentProxy(symbol,raw,now=Date.now()) {
+  const a=raw.split('~'),id=TENCENT_IDENTITIES[symbol],time=parseNewYorkLocal(a[30]);
+  const identityVerified=!!id&&a[0]==='200'&&a[2]===id[0]&&a[46]===id[1]&&a[56]===id[2]&&a[35]==='USD';
+  return validateQuote({symbol,instrument:symbol,name:a[46],kind:'equity',src:'腾讯财经',identityVerified,
+    price:num(a[3]),prev:num(a[4]),chg:num(a[31]),pct:num(a[32]),...time,fetchedAt:now,
+    session:'regular',basis:'previous-close',basisLabel:'腾讯完整常规报价',cached:false},now);
+}
+function parseTencentText(text,codes) {
+  const result={},allowed=new Set(codes);
+  for(const m of text.matchAll(/(?:^|\n)\s*v_([A-Za-z0-9_]+)="([^"\r\n]*)";?/g)) {
+    if(!allowed.has(m[1]))continue;
+    if(Object.hasOwn(result,m[1]))throw new Error('腾讯响应代码重复');
+    result[m[1]]=m[2];
+  }
+  return result;
+}
+async function fetchTencentText(codes,signal) {
+  const ctrl=new AbortController(),abort=()=>ctrl.abort();
+  if(signal?.aborted)throw new Error('请求已取消');
+  signal?.addEventListener('abort',abort,{once:true});
+  const timer=setTimeout(abort,8000);
+  try {
+    const r=await fetch('https://qt.gtimg.cn/q='+codes.join(',')+'&_='+Date.now(),{cache:'no-store',signal:ctrl.signal});
+    if(!r.ok)throw new Error('腾讯 HTTP '+r.status);
+    return parseTencentText(new TextDecoder('gbk').decode(await r.arrayBuffer()),codes);
+  }finally{clearTimeout(timer);signal?.removeEventListener('abort',abort);}
+}
+async function fetchTencentProxies(symbols,signal) {
+  const out={};
+  for(let i=0;i<symbols.length;i+=32) {
+    if(signal?.aborted)throw new Error('请求已取消');
+    const batch=symbols.slice(i,i+32);
+    try {
+      const raw=await withCooldown('tencent-proxies',()=>fetchTencentText(batch.map(s=>'us'+s),signal));
+      batch.forEach(s=>{out[s]=raw['us'+s]?parseTencentProxy(s,raw['us'+s]):invalid({},'腾讯未返回该标的');});
+    }catch(e){if(signal?.aborted)throw e;batch.forEach(s=>{out[s]=invalid({},'腾讯fetch失败（浏览器兼容待验收）：'+e.message);});}
+  }
+  return out;
+}
+function quoteFailureText(d,now=Date.now()) {
+  if(!d?.lastAttempt)return d?.msg;
+  const a=d.lastAttempt;
+  return `本轮请求 ${whenText({quoteAt:a.at})}；本轮源端日期 ${a.sourceDate||'未知'}；拒绝原因：${a.reason}；本地旧缓存日期 ${d.tradeDate||'无'}；最终有效行情日期 ${d.ok?d.tradeDate:'无'}`;
+}
+
 function compatibleFallback(it,candidate,reference,now=Date.now()) {
   if(!candidate)return invalid({},'备用源无报价');
   const d=validateQuote(candidate,now);
@@ -791,7 +954,12 @@ function quoteArray(j) {
 async function fetchCNBC(signal) {
   return withCooldown('cnbc-main',async()=>{
     const a=quoteArray(await fetchJSON(quoteURL(ITEMS.map(i=>i.cnbc)),10000,signal)),out={};
-    ITEMS.forEach(it=>{const q=a.find(q=>q.symbol===it.cnbc);if(q)out[it.cnbc]=parseCNBC(q,it);});return out;
+    ITEMS.forEach(it=>{const q=a.find(q=>q.symbol===it.cnbc);if(q)out[it.cnbc]=parseCNBC(q,it);});
+    if(!usPhase().live)await Promise.all(ITEMS.filter(it=>it.kind==='idx'&&out[it.cnbc]&&(!out[it.cnbc].ok||out[it.cnbc].pct===0)).map(async it=>{
+      const old=out[it.cnbc];
+      if(old&&(!old.identityVerified||(Number.isFinite(old.quoteAt)&&old.quoteAt>Date.now()+300000)))return;
+      try{out[it.cnbc]=await fetchIndexClose(it,signal);}catch(e){if(old)old.msg=(old.msg||'收盘未验证')+'；历史恢复：'+e.message;}
+    }));return out;
   });
 }
 async function fetchMulti(symbols,chunkSize=32,signal) {
@@ -928,6 +1096,11 @@ async function refreshSectors(force,run) {
   try {
     const syms=[...new Set([...SECTORS.map(s=>s.etf),...GROUPS.flatMap(proxySyms)])];
     const result=await fetchMulti(syms,32,run.ctrl.signal);
+    const missing=syms.filter(s=>!result.quotes[s]?.ok);
+    if(missing.length){
+      const backup=await fetchTencentProxies(missing,run.ctrl.signal);
+      missing.forEach(s=>{const q=backup[s];if(q?.ok)result.quotes[s]=q;else result.quotes[s]=invalid(result.quotes[s]||{},[result.quotes[s]?.msg,q?.msg].filter(Boolean).join('；'));});
+    }
     if(!isCurrent(run))return;
     const old=Object.fromEntries(Object.entries(sectorQuotes).map(([s,q])=>[s,{...q,cached:true}]));
     let accepted=0;
@@ -987,7 +1160,7 @@ async function fetchSpark(it,quote,signal) {
   return withCooldown('chart-'+it.key,async()=>validateSpark(await fetchJSON(`${CNBC_CHART}?symbol=${encodeURIComponent(it.cnbc)}&_=${Date.now()}`,9000,signal),it,quote));
 }
 function sparkUsable(it,d,now=Date.now()) {
-  if(it.kind==='cmd')return validateQuote(d,now).ok&&!!inspectCommodityHistory(d.spark,d,now)?.chartReady;
+  if(it.kind==='cmd')return validateQuote(d,now).ok&&!!(d.quoteType==='settlement'?inspectCommodityHistory(d.spark,d,now):inspectCommodityLiveChart(d.spark,d,now))?.chartReady;
   if(!d.spark||now-d.spark.fetchedAt>600000||it.kind==='cmd'||d.src!=='CNBC'||d.spark.symbol!==it.cnbc||d.spark.endDate!==d.tradeDate)return false;
   return validateQuote(d,now).ok;
 }
@@ -1011,19 +1184,19 @@ function sparkSVG(arr, up) {
 function cardHTML(it,d) {
   const c=cls(d.pct),sg=state.spotGold,spot=sg&&validateQuote(sg).ok?`${fmt(sg.price)} · ${whenText(sg)}`:'--（现货时间未验证）';
   const mobileDate=d.tradeDate.slice(5).replace('-','/'),mobileKind=it.kind==='cmd'?(d.quoteType==='settlement'?'日收盘参考':'盘中'):d.status.live?'盘中':'收盘';
-  const mobileNote=[d.cached?'缓存参考':'',d.lastError?'本轮获取失败':'',!Number.isFinite(d.pct)?'涨跌基准未验证':''].filter(Boolean).join(' · ');
+  const mobileNote=[it.kind==='cmd'&&d.basis==='previous-contract-settlement'?(d.comparisonKind==='source-settlement-change'?'源报':'计算')+' · 前结算'+d.settleDate.slice(5).replace('-','/'):'',d.cached?'缓存参考':'',d.lastError?'本轮获取失败':'',!Number.isFinite(d.pct)?'涨跌基准未验证':''].filter(Boolean).join(' · ');
   return `<div class="c-head"><div><div class="c-name">${it.name}</div><div class="c-code">${it.code}</div></div><div class="badge ${d.status.live?'live':it.kind==='cmd'?'cmd':'closed'}">${esc(d.status.text)}${d.cached?' · 缓存':''}</div></div>
     <div class="c-price"><span class="pct ${c} ${bgc(d.pct)}">${pctText(d.pct)}</span><div class="quote-secondary"><span class="price ${c}" id="p-${it.key}">${fmt(d.price)}</span><span class="chg ${c}"><small>涨跌额</small>${Number.isFinite(d.chg)?sign(d.chg)+fmt(d.chg):'--'}</span></div></div>
-    ${it.kind==='cmd'?`<div class="quote-date">${esc(d.when)}</div><div class="spot-line">${esc(d.src)} · ${it.unit} · ${d.comparisonKind==='daily-close-reference'?esc(d.basisLabel):d.quoteType==='settlement'?'收盘／结算参考；涨跌基准未验证':'涨跌基准未验证'}</div>`:''}
-    <div class="c-chart" id="s-${it.key}">${sparkUsable(it,d)?sparkSVG((it.kind==='cmd'?d.spark.bars.slice(-20):d.spark.bars).map(b=>b.close),d.pct>0?true:d.pct<0?false:null):''}</div>
-    <time class="mobile-date" datetime="${esc(d.tradeDate)}" title="${esc(d.when)}">${mobileDate} ${mobileKind}</time>
+    ${it.kind==='cmd'?`<div class="quote-date">${esc(d.when)}</div><div class="spot-line">${esc(d.src)} · ${it.unit} · ${d.comparisonKind?esc(d.basisLabel):d.quoteType==='settlement'?'收盘／结算参考；涨跌基准未验证':'涨跌基准未验证'}</div>`:''}
+    <div class="c-chart" id="s-${it.key}">${sparkUsable(it,d)?sparkSVG((it.kind==='cmd'&&d.spark.kind!=='commodity-intraday'?d.spark.bars.slice(-20):d.spark.bars).map(b=>b.close),d.pct>0?true:d.pct<0?false:null):''}</div>
+    <time class="mobile-date" datetime="${esc(d.tradeDate)}" title="${esc(d.when)}">${mobileDate} ${mobileKind}${it.kind==='cmd'&&sparkUsable(it,d)?(d.spark.kind==='commodity-intraday'?' · 分钟走势':d.quoteType!=='settlement'?' · 历史日线':''):''}</time>
     ${mobileNote?`<div class="mobile-note">${mobileNote}</div>`:''}
     ${it.kind==='cmd'?'<details class="quote-details"><summary>合约、走势与来源详情</summary>':''}
-    ${it.kind==='cmd'&&sparkUsable(it,d)?`<div class="spot-line">20个交易日 · ${esc(d.contract)} 单月未调整 · ${d.spark.bars.slice(-20)[0].date}—${d.tradeDate}${d.spark.cached?' · 历史缓存':''}</div>`:''}
-    <div class="spot-line">${esc(d.src)} · ${it.kind==='cmd'?esc(d.contractName)+' · '+esc(d.contract)+' · '+(d.comparisonKind==='daily-close-reference'?esc(d.basisLabel):d.quoteType==='settlement'?'独立结算字段；前一日结算基准未验证':'涨跌基准未验证'):esc(d.basisLabel)}${d.cached?' · 本地保留数据':''}${d.lastError?' · 本轮获取失败：'+esc(d.lastError):''}${it.kind==='cmd'&&d.rejectedLastQuote?' · 最新价未采用：'+esc(d.rejectedLastQuote.reason):''}${it.kind==='cmd'&&d.commodityHistoryError?' · 历史未更新：'+esc(d.commodityHistoryError):''}</div>
+    ${it.kind==='cmd'&&sparkUsable(it,d)?`<div class="spot-line">${d.spark.kind==='commodity-intraday'?'当前交易时段分钟线（非逐笔实时）':'20个交易日历史日线'} · ${esc(d.contract)} 单月未调整 · ${d.spark.kind==='commodity-intraday'?esc(whenText({quoteAt:d.spark.bars.at(-1).at})):d.spark.bars.slice(-20)[0].date+'—'+d.spark.bars.at(-1).date}${d.spark.cached?' · 历史缓存':''}</div>`:''}
+    <div class="spot-line">${esc(d.src)} · ${it.kind==='cmd'?esc(d.contractName)+' · '+esc(d.contract)+' · '+(d.comparisonKind?esc(d.basisLabel):d.quoteType==='settlement'?'独立结算字段；前一日结算基准未验证':'涨跌基准未验证'):esc(d.basisLabel)}${d.cached?' · 本地保留数据':''}${d.lastError?' · 本轮获取失败：'+esc(d.lastError):''}${it.kind==='cmd'&&d.rejectedLastQuote?' · 最新价未采用：'+esc(d.rejectedLastQuote.reason):''}${it.kind==='cmd'&&d.commodityHistoryError?' · 历史未更新：'+esc(d.commodityHistoryError):''}</div>
     ${it.key==='gc'?`<div class="spot-line">现货黄金 XAU/USD ${esc(spot)}</div>`:''}
     ${it.kind==='cmd'?'</details>':''}
-    <div class="c-foot"><span>${it.kind==='cmd'?(d.comparisonKind==='daily-close-reference'?'前日收盘参考 '+fmt(d.prev):d.quoteType==='settlement'?'结算参考 · '+it.unit:'基准未验证'):'昨收 '+fmt(d.prev)} · 高 ${fmt(d.high)} · 低 ${fmt(d.low)}</span>${it.kind==='cmd'?'':`<span>${esc(d.when)}</span>`}</div>`;
+    <div class="c-foot"><span>${it.kind==='cmd'?(d.comparisonKind==='daily-close-reference'?'前日收盘参考 '+fmt(d.prev):d.quoteType==='settlement'?'结算参考 · '+it.unit:d.basis==='previous-contract-settlement'?'前结算参考 '+fmt(d.prev):'基准未验证'):'昨收 '+fmt(d.prev)} · 高 ${fmt(d.high)} · 低 ${fmt(d.low)}</span>${it.kind==='cmd'?'':`<span>${esc(d.when)}</span>`}</div>`;
 }
 function errorHTML(it,msg) {
   return `<div class="c-head"><div><div class="c-name">${it.name}</div><div class="c-code">${it.code}</div></div><div class="badge closed">暂无有效行情</div></div><div class="c-price"><span class="pct flat flat-bg">--</span><span class="price flat">--</span></div><div class="mobile-note">暂无有效行情 · 日期未确认</div><div class="err-tip">${esc(msg||'数据源暂时不可用')}</div><div class="c-foot"><span>旧记录保留在缓存，不作为当前行情</span><span>--</span></div>${it.key==='gc'?'<div class="spot-line">现货黄金 XAU/USD --（时间未验证）</div>':''}`;
@@ -1034,7 +1207,7 @@ function render() {
     let el=document.getElementById('card-'+it.key);
     if(!el){el=document.createElement('div');el.className='card';el.id='card-'+it.key;grid.appendChild(el);}
     const d=validateQuote(state[it.key]);
-    el.classList.toggle('fail',!d.ok);el.innerHTML=d.ok?cardHTML(it,d):errorHTML(it,d.msg);
+    el.classList.toggle('fail',!d.ok);el.innerHTML=d.ok?cardHTML(it,d):errorHTML(it,it.kind==='idx'?quoteFailureText(d):d.msg);
   });
 }
 function readStored(key) {try{return JSON.parse(localStorage.getItem(key)||'null');}catch(e){return null;}}
@@ -1085,25 +1258,34 @@ async function refresh(force=false,replacement=false) {
       let primary={};
       try{primary=await fetchCNBC(run.ctrl.signal);}catch(e){failure=e.message;}
       if(!isCurrent(run))return;
-      ITEMS.forEach(it=>{const d=primary[it.cnbc];if(d&&validateQuote(d).ok)got[it.key]=d;else if(d)rejected[it.key]=d.msg;});
+      ITEMS.forEach(it=>{const d=primary[it.cnbc];if(d&&validateQuote(d).ok)got[it.key]=d;else if(d)rejected[it.key]=it.kind==='idx'?'CNBC：'+d.msg:d.msg;});
       const need=ITEMS.filter(it=>it.kind==='idx'&&it.tk&&!got[it.key]);
       if(need.length)try{
         const tk=await fetchTencent(need.map(it=>it.tk),run.ctrl.signal);
         if(!isCurrent(run))return;
-        need.forEach(it=>{const d=compatibleFallback(it,tk[it.tk],primary[it.cnbc]);if(d.ok)got[it.key]=d;else rejected[it.key]=d.msg;});
+        await Promise.all(need.map(async it=>{
+          let candidate=tk[it.tk];
+          if(candidate?.identityVerified&&!candidate.ok&&!usPhase().live&&candidate.tradeDate===usPhase().targetDate){
+            try{const close=await fetchIndexClose(it,run.ctrl.signal);
+              if(Math.abs(candidate.price-close.price)<=.005&&Math.abs(candidate.prev-close.prev)<=.005)candidate=validateQuote({...candidate,closeEvidence:{...close.closeEvidence,price:candidate.price,previous:candidate.prev}});
+            }catch(_){}
+          }
+          const d=compatibleFallback(it,candidate,primary[it.cnbc]);if(d.ok)got[it.key]=d;else rejected[it.key]=[rejected[it.key],'腾讯：'+d.msg].filter(Boolean).join('；');
+        }));
       }catch(e){failure=e.message;}
       if(!isCurrent(run))return;
       await Promise.all(ITEMS.filter(it=>it.kind==='idx'&&!got[it.key]).map(async it=>{
-        try {const d=compatibleFallback(it,await fetchEM(it,run.ctrl.signal),primary[it.cnbc]);if(isCurrent(run)){if(d.ok)got[it.key]=d;else rejected[it.key]=d.msg;}}
+        try {const d=compatibleFallback(it,await fetchEM(it,run.ctrl.signal),primary[it.cnbc]);if(isCurrent(run)){if(d.ok)got[it.key]=d;else rejected[it.key]=[rejected[it.key],'东方财富：'+d.msg].filter(Boolean).join('；');}}
         catch(e){if(isCurrent(run))rejected[it.key]=rejected[it.key]||e.message;}
       }));
       if(!isCurrent(run))return;
       let filled=0;
       ITEMS.forEach(it=>{
         const prev=state[it.key],d=got[it.key];
-        if(d){state[it.key]={...d,spark:prev&&prev.spark};filled++;}
+        if(d){state[it.key]={...d,spark:d.spark||(prev&&prev.spark)};filled++;}
         else if(prev&&prev.identityVerified)state[it.key]={...prev,cached:true,lastError:rejected[it.key]||failure||'备用口径未验证'};
         else state[it.key]=invalid({},rejected[it.key]||failure||(it.kind==='cmd'?'商品备用合约、时间和基准未验证':'暂无有效数据'));
+        if(it.kind==='idx'&&!d)state[it.key].lastAttempt={at:Date.now(),sourceDate:primary[it.cnbc]?.tradeDate,reason:rejected[it.key]||failure||'未取得有效报价'};
       });
       render();updateMainStatus(filled,failure);saveCache();
       commodityTask=refreshCommodityHistory(force,run).catch(()=>{});
@@ -1111,6 +1293,7 @@ async function refresh(force=false,replacement=false) {
         sparkAt=Date.now();
         await Promise.all(ITEMS.filter(it=>it.kind!=='cmd'&&validateQuote(state[it.key]).ok&&state[it.key].src==='CNBC'&&!state[it.key].cached).map(async it=>{
           const quote=state[it.key];
+          if(quote.closeEvidence&&quote.spark&&sparkUsable(it,quote))return;
           try{const spark=await fetchSpark(it,quote,run.ctrl.signal);if(isCurrent(run)&&state[it.key]===quote)quote.spark=spark;}
           catch(e){if(isCurrent(run)&&state[it.key]===quote){quote.spark=null;quote.sparkError=e.message;}}
         }));
