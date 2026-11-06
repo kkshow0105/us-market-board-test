@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta name="app-version" content="1.0.4">
+<meta name="app-version" content="1.0.5">
 <meta name="theme-color" content="#f5f6f8">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-title" content="美股行情速览">
@@ -281,7 +281,7 @@
   </section>
 
   <footer>
-    <div class="pwa-controls"><span id="appVersion">程序 v1.0.4</span><span id="pwaStatus" role="status">正在准备离线界面…</span><button class="btn" id="pwaCheckBtn" type="button">检查程序更新</button></div>
+    <div class="pwa-controls"><span id="appVersion">程序 v1.0.5</span><span id="pwaStatus" role="status">正在准备离线界面…</span><button class="btn" id="pwaCheckBtn" type="button">检查程序更新</button></div>
     <div><b>商品收盘口径</b>：卡片的“日收盘参考”对应源端实际日期；涨跌仅在同一具体月份合约的连续两日历史收盘参考价可比时展示，不代表交易所官方结算涨跌。商品曲线采用通过校验的同月合约未调整历史价格；价格可信但比较基准未验证时，涨跌显示 --。进入新交易时段后，旧收盘参考仍须通过原有有效性校验。</div>
     <div><b>数据源</b>：CNBC 行情接口（主）／腾讯财经、东方财富（备用），当前使用公开匿名接口，无需 API Key；访问策略可能变化。备用源需通过身份、日期和口径校验。</div>
     <div><b>说明</b>：黄金取 COMEX 黄金连续期货入口（@GC.1），原油取 ICE 布伦特连续期货入口（@LCO.1），具体合约以源端返回为准，均非现货。期货基准未确认时不显示涨跌；不兼容备用源不自动替换。美股仅显示通过日期校验的常规时段报价；仅日期报价不作为盘中实时价。涨跌颜色按国内习惯：涨红跌绿。行情仅供参考，不构成投资建议。</div>
@@ -459,7 +459,7 @@ function usPhase(now=Date.now()) {
   return {...p,text,live,close,completed,targetDate:live?p.date:completed};
 }
 // 仅在有显式偏移时解析为瞬间，不能把无时区字符串交给设备本地时区猜测。
-function parseQuoteTime(q) {
+function parseQuoteTime(q,index=false) {
   const lt=String(q.last_time||'').trim();
   if(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(lt) && /(?:Z|[+-]\d{2}:?\d{2})$/.test(lt)) {
     if(+lt.slice(11,13)>23||+lt.slice(14,16)>59)return {quoteAt:null,tradeDate:null,timePrecision:'unknown',rawTime:lt};
@@ -473,7 +473,8 @@ function parseQuoteTime(q) {
       if(printedDate!==lt)return {quoteAt:null,tradeDate:null,timePrecision:'unknown',rawTime:lt};
     }
     // CNBC正常时段顶层报价可只提供日期；不编造具体收盘时刻。
-    const tm=String(q.last_timedate||'').match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM)\s+(EST|EDT|BST|GMT|UTC)$/i);
+    const clock=String(q.last_timedate||'').trim();
+    const tm=(index&&printed?clock.slice(printed[0].length):clock).match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM)\s+(EST|EDT|BST|GMT|UTC)$/i);
     if(tm) {
       const hour=(+tm[1]%12)+(/PM/i.test(tm[4])?12:0), offsets={EST:'-05:00',EDT:'-04:00',BST:'+01:00',GMT:'+00:00',UTC:'+00:00'};
       if(+tm[1]>=1&&+tm[1]<=12&&+tm[2]<60&&+(tm[3]||0)<60) return parseQuoteTime({last_time:`${lt}T${String(hour).padStart(2,'0')}:${tm[2]}:${tm[3]||'00'}${offsets[tm[5].toUpperCase()]}`});
@@ -803,7 +804,9 @@ function validateQuote(d, now=Date.now()) {
   if(tradingDay(d.tradeDate)!==true)return invalid(d,'报价日期不是已知美股交易日');
   if(d.tradeDate!==phase.targetDate)return invalid(d,`日期过旧或不符：${d.tradeDate}，需要${phase.targetDate}`,'expired');
   if(d.session!=='regular')return invalid(d,'未确认常规时段报价，未作为收盘使用');
-  if(!phase.live&&((d.kind==='idx'&&d.pct===0)||d.unverifiedZero)&&!closeEvidenceValid(d))return invalid(d,'零涨跌需连续交易日收盘证据，不能仅凭UNCH确认');
+  if(!phase.live&&d.instrument==='sox'&&flatClose(d)&&!confirmedSox(d))
+    return invalid(d,'收盘数据待验证：SOX 疑似持平或占位，缺少另一来源同日收盘佐证');
+  if(!phase.live&&((d.kind==='idx'&&flatClose(d))||d.unverifiedZero)&&!closeEvidenceValid(d))return invalid(d,'零涨跌需连续交易日收盘证据，不能仅凭UNCH确认');
   if(!Number.isFinite(d.prev)||d.prev<=0||!Number.isFinite(d.chg)||!Number.isFinite(d.pct)||d.pct<=-100||Math.abs(d.pct)>1000)return invalid(d,'昨收或涨跌字段异常');
   const calc=d.price-d.prev, pct=calc/d.prev*100;
   if(Math.abs(d.chg-calc)>Math.max(.025,d.price*.00001)||Math.abs(d.pct-pct)>.035)return invalid(d,'价格与涨跌基准不一致');
@@ -819,11 +822,12 @@ function validateQuote(d, now=Date.now()) {
     const fetched=zoneParts(d.fetchedAt),close=EARLY_CLOSE.has(d.tradeDate)?780:960;
     if(fetched.date<d.tradeDate||(fetched.date===d.tradeDate&&fetched.minute<close))return invalid(d,'仅日期报价在收盘前获取，不能作为收盘');
   }
+  if(d.kind==='idx'&&!Number.isFinite(d.quoteAt)&&!closeEvidenceValid(d))return invalid(d,'收盘数据待验证：仅有日期，缺少日线收盘证据');
   if(Number.isFinite(d.quoteAt)) {
     const p=zoneParts(d.quoteAt), close=EARLY_CLOSE.has(d.tradeDate)?780:960;
-    if((p.minute<close-5||p.minute>close+30)&&!(d.kind==='idx'&&closeEvidenceValid(d)))return invalid(d,'非收盘附近常规报价，不能作为最近收盘');
+    if((p.minute<close-(d.kind==='idx'?0:5)||p.minute>close+30)&&!(d.kind==='idx'&&closeEvidenceValid(d)))return invalid(d,'非收盘附近常规报价，不能作为最近收盘');
   }
-  return {...d,ok:true,validity:'recent_close',status:{text:d.timePrecision==='date'?'最近交易日常规报价':'最近收盘参考',live:false},when:whenText(d)};
+  return {...d,ok:true,validity:'recent_close',status:{text:d.kind==='idx'?'已验证收盘参考':d.timePrecision==='date'?'最近交易日常规报价':'最近收盘参考',live:false},when:whenText(d)};
 }
 function verifyIdentity(q,it,sym) {
   if(q.code!==0||String(q.symbol).toUpperCase()!==sym.toUpperCase()||!q.name)return false;
@@ -834,7 +838,7 @@ function verifyIdentity(q,it,sym) {
 }
 function parseCNBC(q,it,now=Date.now()) {
   const symbol=it?it.cnbc:String(q.symbol||'').toUpperCase(), kind=it?it.kind:'equity';
-  const price=num(q.last),prev=num(q.previous_day_closing),time=parseQuoteTime(q);
+  const price=num(q.last),prev=num(q.previous_day_closing),time=parseQuoteTime(q,kind==='idx');
   let chg=num(q.change),pct=num(q.change_pct);
   if(kind!=='cmd'&&Number.isFinite(price)&&prev>0) {
     if(!Number.isFinite(chg))chg=price-prev;
@@ -845,7 +849,7 @@ function parseCNBC(q,it,now=Date.now()) {
   const d={symbol,name:q.name,src:'CNBC',kind,price,prev,chg:kind==='cmd'?NaN:chg,pct:kind==='cmd'?NaN:pct,
     reportedChg:chg,reportedPct:pct,open:num(q.open),high:num(q.high),low:num(q.low),...time,fetchedAt:now,
     ...(kind!=='cmd'&&(/^UNCH$/i.test(String(q.change))||/^UNCH$/i.test(String(q.change_pct)))?{unverifiedZero:true}:{}),
-    identityVerified:verifyIdentity(q,it,symbol)&&contractOK,session:kind==='cmd'?'unknown':'regular',issueId:String(q.issue_id||''),
+    identityVerified:verifyIdentity(q,it,symbol)&&contractOK,session:kind==='cmd'||(kind==='idx'&&/^(PRE|POST|EXT)/i.test(q.curmktstatus||''))?'unknown':'regular',issueId:String(q.issue_id||''),
     rawTimedate:q.last_timedate||'',sourceTimeZone:q.timeZone||'',currency:q.currencyCode||null,exchange:q.exchange||null,sourceRealTime:q.realTime,
     quoteDate:time.tradeDate,tradeDate:kind==='cmd'?null:time.tradeDate,tradeDateVerified:kind!=='cmd',
     instrument:it?it.key:symbol,instrumentType:kind==='cmd'?'continuous-future':'cash',contract,
@@ -858,26 +862,37 @@ function parseCNBC(q,it,now=Date.now()) {
 // 腾讯候选备用：标准 HTTPS fetch；浏览器跨域验收待完成，不使用代理或执行响应脚本。
 const TENCENT_IDENTITIES = {"XLK":["XLK.AM","Select Sector Spdr Trust State Street Technology Select Sector Sp","GP-ETF"],"XLF":["XLF.AM","State Street Financial Select Sector Spdr Etf","GP-ETF"],"XLV":["XLV.AM","Select Sector Spdr Trust State Street Health Care Select Sector S","GP-ETF"],"XLY":["XLY.AM","Select Sector Spdr Trust Sst Cnsmr Discretionary Slct Sctr Spdr E","GP-ETF"],"XLP":["XLP.AM","State Street Consumer Staples Select Sector Spdr Etf","GP-ETF"],"XLE":["XLE.AM","Select Sector Spdr Trust State Street Energy Select Sector Spdr E","GP-ETF"],"XLI":["XLI.AM","Select Sector Spdr Trust State Street Industrial Select Sector Sp","GP-ETF"],"XLB":["XLB.AM","Select Sector Spdr Trust State Street Mtrls Slct Sctr Spdr Etf","GP-ETF"],"XLU":["XLU.AM","Select Sector Spdr Trust State Street Utlts Slct Sctr Spdr Etf","GP-ETF"],"XLRE":["XLRE.AM","Select Sector Spdr Trust State Street Real Estate Select Sector S","GP-ETF"],"XLC":["XLC.AM","Select Sector Spdr Trust State Street Communication Services Sele","GP-ETF"],"GE":["GE.N","Ge Aerospace","GP"],"RTX":["RTX.N","Rtx Corporation","GP"],"CAT":["CAT.N","Caterpillar, Inc.","GP"],"HON":["HON.OQ","Honeywell International Inc.","GP"],"LMT":["LMT.N","Lockheed Martin Corporation","GP"],"BA":["BA.N","Boeing Company (The)","GP"],"ETN":["ETN.N","Eaton Corporation, Plc","GP"],"DE":["DE.N","Deere & Company","GP"],"NOC":["NOC.N","Northrop Grumman Corporation","GP"],"GD":["GD.N","General Dynamics Corporation","GP"],"CTAS":["CTAS.OQ","Cintas Corporation","GP"],"WM":["WM.N","Waste Management, Inc.","GP"],"PAYX":["PAYX.OQ","Paychex, Inc.","GP"],"VRSK":["VRSK.OQ","Verisk Analytics, Inc.","GP"],"RSG":["RSG.N","Republic Services, Inc.","GP"],"EFX":["EFX.N","Equifax, Inc.","GP"],"IYT":["IYT.AM","Ishares Trust U.S.Transportation Etf","GP-ETF"],"CARZ":["CARZ.OQ","First Trust Exch Traded Fund 2 S Network Elec & Future Veh","GP-ETF"],"NKE":["NKE.N","Nike, Inc.","GP"],"LEN":["LEN.N","Lennar Corporation","GP"],"DHI":["DHI.N","D.R. Horton, Inc.","GP"],"LULU":["LULU.OQ","Lululemon Athletica Inc.","GP"],"PHM":["PHM.N","Pultegroup, Inc.","GP"],"GRMN":["GRMN.N","Garmin Ltd.","GP"],"NVR":["NVR.N","Nvr, Inc.","GP"],"HAS":["HAS.OQ","Hasbro, Inc.","GP"],"PEJ":["PEJ.AM","Invesco Exchange Traded Fd Tr Leisure And Entertainment Etf","GP-ETF"],"XRT":["XRT.AM","State Street Spdr S&P Retail Etf","GP-ETF"],"COST":["COST.OQ","Costco Wholesale Corporation","GP"],"WMT":["WMT.OQ","Walmart Inc.","GP"],"SYY":["SYY.N","Sysco Corporation","GP"],"KR":["KR.N","Kroger Company (The)","GP"],"PBJ":["PBJ.AM","Invesco Exchange Traded Fd Tr Dynamic Food & Beverage Etf","GP-ETF"],"PG":["PG.N","Procter & Gamble Company (The)","GP"],"CL":["CL.N","Colgate-Palmolive Company","GP"],"KMB":["KMB.OQ","Kimberly-Clark Corporation","GP"],"EL":["EL.N","Estee Lauder Companies, Inc. (The)","GP"],"IHI":["IHI.AM","Ishares Trust U.S. Medical Devices Etf","GP-ETF"],"IBB":["IBB.OQ","Ishares Trust Ishares Biotechnology Etf","GP-ETF"],"KBE":["KBE.AM","State Street Spdr S&P Bank Etf","GP-ETF"],"KCE":["KCE.AM","State Street Spdr S&P Capital Markets Etf","GP-ETF"],"KIE":["KIE.AM","State Street Spdr S&P Insurance Etf","GP-ETF"],"IGV":["IGV.AM","Ishares Trust Expanded Tech-Software Sector Etf","GP-ETF"],"AAPL":["AAPL.OQ","Apple Inc.","GP"],"CSCO":["CSCO.OQ","Cisco Systems, Inc.","GP"],"ANET":["ANET.N","Arista Networks, Inc.","GP"],"DELL":["DELL.N","Dell Technologies Inc.","GP"],"MSI":["MSI.N","Motorola Solutions, Inc.","GP"],"HPQ":["HPQ.N","Hp Inc.","GP"],"SMH":["SMH.OQ","Vaneck Etf Tr Semiconductor Etf","GP-ETF"],"XTL":["XTL.AM","State Street Spdr S&P Telecom Etf","GP-ETF"],"META":["META.OQ","Meta Platforms, Inc.","GP"],"GOOGL":["GOOGL.OQ","Alphabet Inc.","GP"],"NFLX":["NFLX.OQ","Netflix, Inc.","GP"],"DIS":["DIS.N","Walt Disney Company (The)","GP"],"CMCSA":["CMCSA.OQ","Comcast Corporation","GP"],"CBRE":["CBRE.N","Cbre Group Inc","GP"],"CSGP":["CSGP.OQ","Costar Group, Inc.","GP"],"ZG":["ZG.OQ","Zillow Group, Inc.","GP"],"VNQ":["VNQ.AM","Vanguard Index Funds Real Estate Etf","GP-ETF"]};
 const INDEX_HISTORY_IDS={spx:'593933',ndx:'579435',sox:'577591',nbi:'567026'};
+function flatClose(d) {
+  return d.unverifiedZero||d.price===d.prev||Math.abs(d.pct)<.005;
+}
+function confirmedSox(d) {
+  const e=d.soxConfirmation;
+  return d.src==='CNBC'&&closeEvidenceValid(d)&&d.closeEvidence.activeBar===true&&
+    e?.source==='东方财富日线'&&e.date===d.tradeDate&&e.previousDate===previousTradingDay(d.tradeDate)&&
+    Math.abs(e.price-d.price)<=.0051&&Math.abs(e.previous-d.prev)<=.0051;
+}
 function closeEvidenceValid(d) {
   if(d.instrument==='sox'&&d.src==='东方财富')return soxCloseEvidenceValid(d);
   const e=d.closeEvidence;
+  if(e?.source==='腾讯日线'&&d.src==='腾讯财经')return e.symbol===d.symbol&&e.date===d.tradeDate&&
+    e.previousDate===previousTradingDay(d.tradeDate)&&e.price===d.price&&e.previous===d.prev;
   return !!e && e.date===d.tradeDate && e.previousDate===previousTradingDay(d.tradeDate) &&
-    e.price===d.price && e.previous===d.prev && e.source==='CNBC日线' && e.adjusted==='UNADJUSTED';
+    e.price===d.price && e.previous===d.prev && (!flatClose(d)||e.activeBar===true) && e.source==='CNBC日线' && e.adjusted==='UNADJUSTED';
 }
 function restoreIndexClose(j,it,now=Date.now()) {
   const phase=usPhase(now),data=j&&j.barData,details=j&&j.requestDetails;
   if(phase.live||!phase.targetDate||!data||!details||details.symbol!==it.cnbc||details.adjusted!=='UNADJUSTED'||
     String(data.symbol)!==INDEX_HISTORY_IDS[it.key]||!INDEX_NAMES[it.key].test(data.companyName||'')||!Array.isArray(data.priceBars))throw new Error('指数收盘历史身份或口径未验证');
-  const bars=data.priceBars.map(b=>({date:String(b.tradeTime||'').slice(0,8).replace(/^(\d{4})(\d{2})(\d{2})$/,'$1-$2-$3'),close:num(b.close),raw:String(b.tradeTime||'')}));
+  const bars=data.priceBars.map(b=>({date:String(b.tradeTime||'').slice(0,8).replace(/^(\d{4})(\d{2})(\d{2})$/,'$1-$2-$3'),close:num(b.close),high:num(b.high),low:num(b.low),open:num(b.open),raw:String(b.tradeTime||'')}));
   if(bars.some(b=>!/^\d{8}000000$/.test(b.raw)||!validDate(b.date)||tradingDay(b.date)!==true||b.date>phase.targetDate||!Number.isFinite(b.close)||b.close<=0)||new Set(bars.map(b=>b.date)).size!==bars.length)throw new Error('指数历史日期、重复或价格异常');
   bars.sort((a,b)=>a.date.localeCompare(b.date));
   const last=bars.at(-1),previous=bars.at(-2);
-  if(!last||!previous||last.date!==phase.targetDate||previous.date!==previousTradingDay(last.date))throw new Error('缺少最近连续两个交易日收盘');
+  if(!last||!previous||last.date!==phase.targetDate||previous.date!==previousTradingDay(last.date))throw new Error('尚未发布或缺少最近连续两个交易日收盘；最新 '+(last?.date||'无')+'，期望 '+phase.targetDate);
   const price=last.close,prev=previous.close;
   return validateQuote({symbol:it.cnbc,name:data.companyName,instrument:it.key,kind:'idx',src:'CNBC',identityVerified:true,
     issueId:String(data.symbol),price,prev,chg:price-prev,pct:(price/prev-1)*100,tradeDate:last.date,quoteAt:null,timePrecision:'date',
     fetchedAt:now,session:'regular',basis:'previous-close',basisLabel:'连续两交易日未调整收盘',cached:false,
-    closeEvidence:{source:'CNBC日线',adjusted:'UNADJUSTED',date:last.date,previousDate:previous.date,price,previous:prev},
+    closeEvidence:{source:'CNBC日线',activeBar:last.low>0&&last.low<last.high&&[last.close,last.open].every(v=>v>=last.low&&v<=last.high)&&['open','high','low'].some(k=>previous[k]!==last[k]),adjusted:'UNADJUSTED',date:last.date,previousDate:previous.date,price,previous:prev},
     spark:{symbol:it.cnbc,src:'CNBC',bars:bars.slice(-22).map(({date,close})=>({date,close})),endDate:last.date,fetchedAt:now}},now);
 }
 async function fetchIndexClose(it,signal) {
@@ -925,15 +940,16 @@ async function fetchTencentProxies(symbols,signal) {
 function quoteFailureText(d,now=Date.now()) {
   if(!d?.lastAttempt)return d?.msg;
   const a=d.lastAttempt;
-  return `本轮请求 ${whenText({quoteAt:a.at})}；本轮源端日期 ${a.sourceDate||'未知'}；拒绝原因：${a.reason}；本地旧缓存日期 ${d.tradeDate||'无'}；最终有效行情日期 ${d.ok?d.tradeDate:'无'}`;
+  return `本轮请求 ${whenText({quoteAt:a.at})}；本轮源端日期 ${a.sourceDate||'未知'}；期望交易日 ${usPhase(now).targetDate||'未知'}；拒绝原因：${a.reason}；本地旧缓存日期 ${d.tradeDate||'无'}；最终有效行情日期 ${d.ok?d.tradeDate:'无'}`;
 }
 
 function compatibleFallback(it,candidate,reference,now=Date.now()) {
   if(!candidate)return invalid({},'备用源无报价');
   const d=validateQuote(candidate,now);
   if(!d.ok)return d;
+  if(it.kind==='idx'&&(d.kind!=='idx'||d.basis!=='previous-close'))return invalid(d,'备用指数身份或昨收基准不兼容');
   if(d.instrument!==it.key)return invalid(d,'备用标的身份不兼容');
-  if(reference&&validDate(reference.tradeDate)&&d.tradeDate<reference.tradeDate)return invalid(d,'备用报价早于主源日期');
+  if(reference&&(it.kind!=='idx'||reference.ok)&&validDate(reference.tradeDate)&&d.tradeDate<reference.tradeDate)return invalid(d,'备用报价早于主源日期');
   if(it.kind==='cmd') {
     if(!reference||d.instrumentType!==reference.instrumentType||!d.contract||d.contract!==reference.contract||
       !candidate.tradeDateVerified||candidate.tradeDate!==reference.tradeDate||!d.tradeDateVerified||!reference.tradeDateVerified||!validDate(d.tradeDate)||d.tradeDate!==reference.tradeDate||
@@ -973,16 +989,25 @@ function quoteArray(j) {
   const a=j&&j.FormattedQuoteResult&&j.FormattedQuoteResult.FormattedQuote;
   if(!Array.isArray(a))throw new Error('CNBC返回结构异常');return a;
 }
-async function fetchCNBC(signal) {
-  return withCooldown('cnbc-main',async()=>{
-    const a=quoteArray(await fetchJSON(quoteURL(ITEMS.map(i=>i.cnbc)),10000,signal)),out={};
-    ITEMS.forEach(it=>{const q=a.find(q=>q.symbol===it.cnbc);if(q)out[it.cnbc]=parseCNBC(q,it);});
-    if(!usPhase().live)await Promise.all(ITEMS.filter(it=>it.kind==='idx'&&out[it.cnbc]&&(!out[it.cnbc].ok||out[it.cnbc].pct===0)).map(async it=>{
-      const old=out[it.cnbc];
-      if(old&&(!old.identityVerified||(Number.isFinite(old.quoteAt)&&old.quoteAt>Date.now()+300000)))return;
-      try{out[it.cnbc]=await fetchIndexClose(it,signal);}catch(e){if(old)old.msg=(old.msg||'收盘未验证')+'；历史恢复：'+e.message;}
-    }));return out;
-  });
+async function fetchCNBC(signal,items=ITEMS) {
+  let rows=[],error='';
+  try{rows=await withCooldown('cnbc-main',async()=>quoteArray(await fetchJSON(quoteURL(items.map(i=>i.cnbc)),10000,signal)));}
+  catch(e){if(signal?.aborted)throw e;error='响应失败：'+e.message;}
+  const out={};
+  await Promise.all(items.map(async it=>{
+    const q=rows.find(q=>q?.symbol===it.cnbc);
+    if(q)out[it.cnbc]=parseCNBC(q,it);
+    if(it.kind!=='idx'){if(error)out[it.cnbc]=invalid({},'CNBC：'+error);return;}
+    const old=out[it.cnbc]||invalid({},error||'未返回该指数');
+    out[it.cnbc]=old;
+    const phase=usPhase();
+    if(signal?.aborted||old.ok||phase.live||!phase.targetDate)return;
+    try{
+      const close=await fetchIndexClose(it,signal);
+      if(close.ok||close.closeEvidence)out[it.cnbc]=close;
+    }catch(e){old.msg+='（原始日期 '+(old.tradeDate||old.rawTime||'未知')+'）；CNBC日线：'+e.message;}
+  }));
+  return out;
 }
 async function fetchMulti(symbols,chunkSize=32,signal) {
   const out={};let success=0,failures=0;
@@ -1024,7 +1049,7 @@ function fetchTencent(codes,signal) {
     const t=setTimeout(()=>finish(new Error('腾讯请求超时')),8000);
     s.onload=()=>finish();s.onerror=()=>finish(new Error('腾讯脚本加载失败'));
     if(signal)signal.addEventListener('abort',cancel,{once:true});
-    s.src='https://qt.gtimg.cn/q='+codes.join(',')+'&_='+Date.now();document.head.appendChild(s);
+    s.src='https://qt.gtimg.cn/q='+codes.join(',')+'&_='+Date.now();try{document.head.appendChild(s);}catch(e){finish(e);}
   }));
 }
 function parseTencent(code,raw,now=Date.now()) {
@@ -1041,8 +1066,25 @@ function parseTencent(code,raw,now=Date.now()) {
   const internal={usINX:'.INX',usIXIC:'.IXIC',usNBI:'.NBI'};
   return validateQuote({symbol:code,name:a[1],instrument:it&&it.key,kind:'idx',src:'腾讯财经',
     price:num(a[3]),prev:num(a[4]),open:num(a[5]),chg:num(a[31]),pct:num(a[32]),high:num(a[33]),low:num(a[34]),
-    ...time,fetchedAt:now,identityVerified:!!it&&a[2]===internal[code]&&INDEX_NAMES[it.key].test(a[1]),
+    ...time,fetchedAt:now,identityVerified:!!it&&a[2]===internal[code]&&a[35]==='USD'&&a[56]==='ZS'&&INDEX_NAMES[it.key].test(a[1])&&INDEX_NAMES[it.key].test(a[46]),
     session:'regular',instrumentType:'cash',basis:'previous-close',basisLabel:'昨收',cached:false},now);
+}
+// 只读取指数原始 day 数组；不接受复权数组或以报价的更新时间推定交易日。
+async function fetchTencentClose(it,signal) {
+  return withCooldown('tk-close-'+it.key,async()=>{
+    const j=await fetchJSON('https://web.ifzq.gtimg.cn/appstock/app/usfqkline/get?param='+it.tk+',day,,,10,qfq',8000,signal);
+    const data=j?.data?.[it.tk],a=data?.qt?.[it.tk],bars=data?.day;
+    if(j?.code!==0||!Array.isArray(a)||!Array.isArray(bars))throw new Error('腾讯日线身份或口径未验证');
+    const d=parseTencent(it.tk,a.join('~')),p=usPhase(),last=bars.at(-1),prev=bars.at(-2);
+    if(p.live||!p.targetDate||last?.[0]!==p.targetDate||!prev||prev[0]!==previousTradingDay(p.targetDate))
+      throw new Error('尚未发布连续交易日收盘；最新 '+(last?.[0]||'无')+'，期望 '+p.targetDate);
+    if(!d.identityVerified)throw new Error('腾讯快照代码、名称、币种或指数类型未验证；原始日期 '+(d.tradeDate||'未知'));
+    if(d.tradeDate!==p.targetDate||!Number.isFinite(d.quoteAt)||zoneParts(d.quoteAt).minute<(EARLY_CLOSE.has(d.tradeDate)?780:960)||
+      (flatClose(d)&&[1,3,4].every(k=>num(last[k])===num(prev[k])))||
+      num(last[2])!==d.price||num(prev[2])!==d.prev||num(last[3])!==d.high||num(last[4])!==d.low||
+      !(d.low>0&&d.high>d.low&&d.price>=d.low&&d.price<=d.high))throw new Error('腾讯快照与日线收盘基准未通过校验，快照日期 '+(d.tradeDate||'未知'));
+    return validateQuote({...d,closeEvidence:{source:'腾讯日线',symbol:it.tk,date:last[0],previousDate:prev[0],price:d.price,previous:d.prev},basisLabel:'腾讯日线与昨收已核对'});
+  });
 }
 function parseNewYorkLocal(raw) {
   const m=String(raw||'').match(/^(\d{4}-\d{2}-\d{2}) (\d{2}):(\d{2}):(\d{2})$/);
@@ -1096,11 +1138,11 @@ function parseSoxDaily(j,now=Date.now()) {
     byDate.set(date,{date,close,pct});
   }
   const bars=[...byDate.values()].sort((a,b)=>a.date.localeCompare(b.date)),last=bars.at(-1),previous=bars.at(-2);
-  if(!last||!previous||last.date!==phase.targetDate||previous.date!==previousTradingDay(last.date))throw new Error('SOX缺少最近连续两个交易日收盘');
+  if(!last||!previous||last.date!==phase.targetDate||previous.date!==previousTradingDay(last.date))throw new Error('SOX尚未发布或缺少最近连续两个交易日收盘；最新 '+(last?.date||'无')+'，期望 '+phase.targetDate);
   const price=last.close,prev=previous.close,chg=price-prev,pct=(price/prev-1)*100;
   if(Math.abs(last.pct-pct)>.035)throw new Error('SOX日线涨跌基准不一致');
   const d={symbol:'.SOX',name:'费城半导体指数(SOX)',instrument:'sox',kind:'idx',src:'东方财富',identityVerified:true,
-    issueId:'EMI00055562',price,prev,chg,pct,tradeDate:last.date,quoteAt:null,timePrecision:'date',fetchedAt:now,
+    issueId:'EMI00055562',price,prev,chg,pct,unverifiedZero:last.pct===0,tradeDate:last.date,quoteAt:null,timePrecision:'date',fetchedAt:now,
     session:'regular',basis:'previous-close',basisLabel:'同源连续两交易日收盘',cached:false,
     closeEvidence:{source:'东方财富日线',indicatorId:'EMI00055562',date:last.date,previousDate:previous.date,price,previous:prev},
     spark:{symbol:'.SOX',src:'东方财富',bars:bars.slice(-20).map(({date,close})=>({date,close})),endDate:last.date,fetchedAt:now}};
@@ -1265,8 +1307,9 @@ function cardHTML(it,d) {
     <div class="c-foot"><span>${it.kind==='cmd'?(d.comparisonKind==='daily-close-reference'?'前日收盘参考 '+fmt(d.prev):d.quoteType==='settlement'?'结算参考 · '+it.unit:d.basis==='previous-contract-settlement'?'前结算参考 '+fmt(d.prev):'基准未验证'):'昨收 '+fmt(d.prev)} · 高 ${fmt(d.high)} · 低 ${fmt(d.low)}</span>${it.kind==='cmd'?'':`<span>${esc(d.when)}</span>`}</div>`;
 }
 function errorHTML(it,msg) {
+  const pending=it.kind==='idx'&&!usPhase().live?'收盘数据待验证':'暂无有效行情 · 日期未确认';
   const reason=String(msg||'数据源暂时不可用'),short=reason.includes('价格异常')?'价格异常':reason.includes('来自未来')?'报价时间异常':reason.includes('日期')||reason.includes('过旧')?'行情日期待验证':reason.includes('基准')?'涨跌基准待验证':'行情暂不可用';
-  return `<div class="c-head"><div><div class="c-name">${it.name}</div><div class="c-code">${it.code}</div></div><div class="badge closed">暂无有效行情</div></div><div class="c-price"><span class="pct flat flat-bg">--</span><span class="price flat">--</span></div><div class="mobile-note">暂无有效行情 · 日期未确认</div><div class="err-tip">${short}</div><details class="failure-details"><summary>查看诊断</summary><div class="diagnostic">${esc(reason)}</div></details><div class="c-foot"><span>旧记录保留在缓存，不作为当前行情</span><span>--</span></div>${it.key==='gc'?'<div class="spot-line">现货黄金 XAU/USD --（时间未验证）</div>':''}`;
+  return `<div class="c-head"><div><div class="c-name">${it.name}</div><div class="c-code">${it.code}</div></div><div class="badge closed">${it.kind==='idx'&&!usPhase().live?'收盘数据待验证':'暂无有效行情'}</div></div><div class="c-price"><span class="pct flat flat-bg">--</span><span class="price flat">--</span></div><div class="mobile-note">${pending}</div><div class="err-tip">${short}</div><details class="failure-details"><summary>查看诊断</summary><div class="diagnostic">${esc(reason)}</div></details><div class="c-foot"><span>旧记录保留在缓存，不作为当前行情</span><span>--</span></div>${it.key==='gc'?'<div class="spot-line">现货黄金 XAU/USD --（时间未验证）</div>':''}`;
 }
 function render() {
   const grid=document.getElementById('grid');
@@ -1298,12 +1341,15 @@ function loadCache() {
 function isCurrent(run) {return activeRefresh===run&&run.id===refreshVersion&&!run.ctrl.signal.aborted;}
 function updateMainStatus(filled,errors) {
   const valid=ITEMS.map(it=>validateQuote(state[it.key])).filter(d=>d.ok),cached=valid.filter(d=>d.cached).length;
+  filled=Math.min(filled,valid.filter(d=>!d.cached&&(!activeRefresh?.requested||activeRefresh.requested.some(it=>it.key===d.instrument))).length);
   lastMainResult={filled,errors};
-  filled=Math.min(filled,valid.filter(d=>!d.cached).length);
   document.getElementById('dot').className='dot '+(filled===6?'ok':'err');
   document.getElementById('stateText').textContent=filled?`本轮取得有效报价 ${filled}/6；显示${valid.length}/6（缓存${cached}）`:`本轮未取得有效报价；显示${valid.length}/6（缓存${cached}）${errors?' · '+errors:''}`;
   document.getElementById('srcTag').textContent='数据源：'+([...new Set(valid.map(d=>d.src))].join(' / ')||'—');
 }
+// 收盘后六小时内借用常规刷新时钟；失败指数按 1/2/4/5 分钟退避。
+const closeRetries={};
+function closeWindow(p){return !p.live&&p.targetDate===p.date&&p.minute>=p.close&&p.minute<p.close+360;}
 async function refresh(force=false,replacement=false) {
   if(document.hidden)return;
   if(activeRefresh) {
@@ -1322,37 +1368,53 @@ async function refresh(force=false,replacement=false) {
     const industry=refreshSectors(force,run);
     let commodityTask=Promise.resolve();
     try {
+      const phase=usPhase(),transition=closeWindow(phase)&&ITEMS.some(it=>it.kind==='idx'&&!validateQuote(state[it.key]).ok);
+      const items=ITEMS.filter(it=>it.kind!=='idx'||!transition||force||
+        (!validateQuote(state[it.key]).ok&&(closeRetries[it.key]?.date!==phase.targetDate||Date.now()>=closeRetries[it.key].at)));
+      run.requested=items;
       let primary={};
-      try{primary=await fetchCNBC(run.ctrl.signal);}catch(e){failure=e.message;}
+      try{primary=await fetchCNBC(run.ctrl.signal,items);}catch(e){failure=e.message;}
       if(!isCurrent(run))return;
-      ITEMS.forEach(it=>{const d=primary[it.cnbc];if(d&&validateQuote(d).ok)got[it.key]=d;else if(d)rejected[it.key]=it.kind==='idx'?'CNBC：'+d.msg:d.msg;});
-      const need=ITEMS.filter(it=>it.kind==='idx'&&it.tk&&!got[it.key]);
+      items.forEach(it=>{const d=primary[it.cnbc];if(d&&validateQuote(d).ok)got[it.key]=d;else if(d)rejected[it.key]=it.kind==='idx'?'CNBC：'+d.msg:d.msg;});
+      const need=items.filter(it=>it.kind==='idx'&&it.tk&&!got[it.key]);
       if(need.length)try{
         const tk=await fetchTencent(need.map(it=>it.tk),run.ctrl.signal);
         if(!isCurrent(run))return;
-        await Promise.all(need.map(async it=>{
-          let candidate=tk[it.tk];
-          if(candidate?.identityVerified&&!candidate.ok&&!usPhase().live&&candidate.tradeDate===usPhase().targetDate){
-            try{const close=await fetchIndexClose(it,run.ctrl.signal);
-              if(Math.abs(candidate.price-close.price)<=.005&&Math.abs(candidate.prev-close.prev)<=.005)candidate=validateQuote({...candidate,closeEvidence:{...close.closeEvidence,price:candidate.price,previous:candidate.prev}});
-            }catch(_){}
-          }
-          const d=compatibleFallback(it,candidate,primary[it.cnbc]);if(d.ok)got[it.key]=d;else rejected[it.key]=[rejected[it.key],'腾讯：'+d.msg].filter(Boolean).join('；');
-        }));
-      }catch(e){failure=e.message;}
+        need.forEach(it=>{
+          const d=compatibleFallback(it,tk[it.tk],primary[it.cnbc]);
+          if(d.ok)got[it.key]=d;else rejected[it.key]=[rejected[it.key],'腾讯快照：'+d.msg+'（'+(d.tradeDate||'日期未知')+'）'].filter(Boolean).join('；');
+        });
+      }catch(e){need.forEach(it=>{rejected[it.key]=[rejected[it.key],'腾讯快照响应失败：'+e.message].filter(Boolean).join('；');});}
       if(!isCurrent(run))return;
-      await Promise.all(ITEMS.filter(it=>it.kind==='idx'&&!got[it.key]).map(async it=>{
-        try {const d=compatibleFallback(it,await fetchEM(it,run.ctrl.signal),primary[it.cnbc]);if(isCurrent(run)){if(d.ok)got[it.key]=d;else rejected[it.key]=[rejected[it.key],'东方财富：'+d.msg].filter(Boolean).join('；');}}
-        catch(e){if(isCurrent(run))rejected[it.key]=rejected[it.key]||e.message;}
+      await Promise.all(items.filter(it=>it.kind==='idx'&&!got[it.key]).map(async it=>{
+        if(it.tk&&!usPhase().live){
+          try{const d=compatibleFallback(it,await fetchTencentClose(it,run.ctrl.signal),primary[it.cnbc]);
+            if(d.ok){got[it.key]=d;return;}throw new Error(d.msg);
+          }catch(e){rejected[it.key]=[rejected[it.key],'腾讯日线：'+e.message].filter(Boolean).join('；');}
+        }
+        if(!isCurrent(run))return;
+        try {let candidate=await fetchEM(it,run.ctrl.signal);
+          const main=primary[it.cnbc];
+          if(it.key==='sox'&&main?.closeEvidence&&candidate.closeEvidence&&flatClose(main)&&soxCloseEvidenceValid(candidate)){
+            const confirmed=validateQuote({...main,soxConfirmation:candidate.closeEvidence});
+            if(confirmed.ok)candidate=confirmed;
+          }
+          const d=compatibleFallback(it,candidate,main);if(isCurrent(run)){if(d.ok)got[it.key]=d;else rejected[it.key]=[rejected[it.key],'东方财富：'+d.msg+'（原始日期 '+(d.tradeDate||'未知')+'）'].filter(Boolean).join('；');}}
+        catch(e){if(isCurrent(run))rejected[it.key]=[rejected[it.key],'东方财富：'+e.message].filter(Boolean).join('；');}
       }));
       if(!isCurrent(run))return;
       let filled=0;
-      ITEMS.forEach(it=>{
+      items.forEach(it=>{
         const prev=state[it.key],d=got[it.key];
+        if(transition&&it.kind==='idx'){
+          if(d)delete closeRetries[it.key];
+          else{const prior=closeRetries[it.key],delay=Math.min(300000,prior?.date===phase.targetDate?prior.delay*2:60000);
+            closeRetries[it.key]={date:phase.targetDate,delay,at:Date.now()+delay};}
+        }
         if(d){state[it.key]={...d,spark:d.spark||(prev&&prev.spark)};filled++;}
         else if(prev&&prev.identityVerified)state[it.key]={...prev,cached:true,lastError:rejected[it.key]||failure||'备用口径未验证'};
         else state[it.key]=invalid({},rejected[it.key]||failure||(it.kind==='cmd'?'商品备用合约、时间和基准未验证':'暂无有效数据'));
-        if(it.kind==='idx'&&!d)state[it.key].lastAttempt={at:Date.now(),sourceDate:primary[it.cnbc]?.tradeDate,reason:rejected[it.key]||failure||'未取得有效报价'};
+        if(it.kind==='idx'&&!d)state[it.key].lastAttempt={at:Date.now(),sourceDate:primary[it.cnbc]?.tradeDate||primary[it.cnbc]?.rawTime,reason:rejected[it.key]||failure||'未取得有效报价'};
       });
       render();updateMainStatus(filled,failure);saveCache();
       commodityTask=refreshCommodityHistory(force,run,primary).catch(()=>{});
